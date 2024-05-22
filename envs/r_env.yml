@@ -1,0 +1,16 @@
+channels:
+  - conda-forge
+  - bioconda
+
+dependencies:
+  - r-base
+  - r-devtools
+  - r-ggplot2
+  - bioconductor-atacseqqc
+  - r-optparse
+  - r-data.table
+  - r-dplyr
+  - r-tidyr
+  - r-knitr
+  - r-reshape2
+  - r-plyr
