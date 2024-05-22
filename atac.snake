@@ -1,0 +1,338 @@
+# Define conditions and reads
+condition = ['ATAC3', 'ATAC4']
+rep = ['R1', 'R2']
+region=["NFR", "NBR"]
+
+# Rule for multiqc, bigwig generation, and reproducible filtered peaks
+rule all:
+    input:
+        expand("results/{region}_{condition}_sorted.bam", region=region , condition=condition),
+        expand("results/{region}_{condition}_sorted.bam.bai", region=region, condition=condition),
+        expand("results/{region}_{condition}.bw", region=region, condition=condition),
+        expand("results/{condition}_profile.pdf", condition=condition),
+        'results/homer_motif_analysis/',
+        'results/chromatin_accessibility.txt',
+        'results/homer_gene_annotations.txt'
+
+# Rule for FastQC
+rule fastqc:
+    input:
+        fastq='samples/{condition}_{rep}.fastq.gz'
+    output:
+        fastqc='results/{condition}_{rep}_fastqc.html'
+    params:
+        outdir='results/'
+    threads: 4
+    conda:
+        'envs/fastqc_env.yml'
+    shell:
+        '''
+        fastqc {input.fastq} -o {params.outdir}
+        '''
+
+# Rule for MultiQC
+rule multiqc:
+    input:
+        flagstat=expand('results/{condition}_{rep}_fastqc.html', condition=condition, rep=rep)
+    output:
+        'results_interim/multiqc_report.html'
+    params:
+        'results/'
+    conda:
+        'envs/multiqc_env.yml'
+    shell:
+        '''
+        multiqc {params} -o {params} -f
+        '''
+
+# Rule for building Bowtie2 index
+rule bowtie2_build_gencode:
+    input:
+        "samples/GRCh38.primary_assembly.genome.fa.gz"
+    output:
+        "results/genome_index_file.1.bt2"
+    params:
+        "results/genome_index_file"
+    threads: 16
+    conda:
+        'envs/bowtie2_env.yml'
+    shell:
+        '''
+        bowtie2-build {input} {params}
+        '''
+
+# Rule for trimming adapters
+rule trimmomatic:
+    input:
+        r1='samples/{condition}_R1.fastq.gz',
+        r2='samples/{condition}_R2.fastq.gz'
+    output:
+        trimmed_r1='results/{condition}_R1.trimmed.fastq',
+        trimmed_r2='results/{condition}_R2.trimmed.fastq',
+        unpaired_r1='results/{condition}_R1.unpaired.fastq',
+        unpaired_r2='results/{condition}_R2.unpaired.fastq'
+    threads: 8
+    params:
+        adapter='samples/NexteraPE.fa'
+    conda:
+        'envs/trimmomatic_env.yml'
+    shell:
+        """
+        trimmomatic PE {input.r1} {input.r2} {output.trimmed_r1} {output.unpaired_r1} {output.trimmed_r2} {output.unpaired_r2} ILLUMINACLIP:{params.adapter}:2:30:10
+        """
+
+# Rule for aligning reads with Bowtie2
+rule bowtie2_align:
+    input:
+        index='results_interim/genome_index_file.1.bt2',
+        trimmed_r1='results/{condition}_R1.trimmed.fastq',
+        trimmed_r2='results/{condition}_R2.trimmed.fastq'
+    output:
+        bam='results/{condition}.bam'
+    threads: 16
+    params:
+        dir='results_interim/genome_index_file'
+    conda:
+        'envs/bowtie2_env.yml'
+    shell:
+        """
+        bowtie2 -x {params.dir} -1 {input.trimmed_r1} -2 {input.trimmed_r2} --threads 15 | samtools view -bS - > {output.bam}
+        """
+
+# Rule to sort BAM files
+# rule sort_bam_mito:
+#    input:
+#        bam="results/{condition}.bam",
+#        filtered_bam="results/{condition}_shifted_no_mito.bam"
+#    output:
+#        sorted_bam="results/{condition}_shifted_no_mito_sorted.bam"
+#    conda:
+#        'envs/samtools_env.yml'
+#    shell:
+#        """
+#        samtools sort {input.bam} -o {output.sorted_bam}
+#        """
+
+# Rule to index sorted BAM files
+# rule index_bam_mito:
+#    input:
+#        bam="results/{condition}_shifted_no_mito_sorted.bam"
+#    output:
+#        bai="results/{condition}_shifted_no_mito_sorted.bam.bai"
+#    conda:
+#        'envs/samtools_env.yml'
+#    shell:
+#        """
+#        samtools index {input.bam}
+#        """
+
+# Rule to shift reads for ATAC-Seq
+rule shift_reads:
+    input:
+        bai="results/{condition}_sorted.bam.bai",
+        bam="results/{condition}_sorted.bam"
+    output:
+        shifted_bam="results/{condition}_shifted.bam"
+    conda:
+        'envs/deeptools_env.yml'
+    shell:
+        """
+        alignmentSieve --ATACshift --bam {input.bam} -o {output.shifted_bam}
+        """
+
+# Rule to filter out mitochondrial DNA
+rule remove_mitochondrial_dna:
+    input:
+        bam="results/{condition}_shifted.bam"
+    output:
+        filtered_bam="results/{condition}_shifted_no_mito.bam"
+    conda:
+        'envs/samtools_env.yml'
+    shell:
+        """
+        samtools view -h {input.bam} | grep -v '^chrM' | samtools view -bS - > {output.filtered_bam}
+        """
+
+# Rule to call peaks with MACS3
+rule macs3_callpeak:
+    input:
+        bam="results/{condition}_shifted_no_mito.bam"
+    output:
+        peaks="results/{condition}_peaks.narrowPeak",
+        summits="results/{condition}_summits.bed"
+    conda:
+        'envs/mac_env.yml'
+    shell:
+        """
+        macs3 callpeak -f BAMPE -t {input.bam} --outdir results/ -n {wildcards.condition}
+        """
+
+# Rule to get reproducible peaks by intersecting
+rule intersect_peaks:
+    input:
+        peak1='results/ATAC3_peaks.narrowPeak',
+        peak2='results/ATAC4_peaks.narrowPeak'
+    output:
+        reproducible_peak='results/ATAC_reproducible_peaks.bed'
+    conda:
+        'envs/bedtools_env.yml'
+    shell:
+        '''
+        bedtools intersect -a {input.peak1} -b {input.peak2} > {output.reproducible_peak}
+        '''
+
+# Rule to filter reproducible peaks against blacklist regions
+rule filter_blacklist:
+    input:
+        peaks='results/ATAC_reproducible_peaks.bed',
+        blacklist='samples/hg38-blacklist.v2.bed'
+    output:
+        filtered_peaks='results/ATAC_reproducible_filtered_peaks.bed'
+    conda:
+        'envs/bedtools_env.yml'
+    shell:
+        """
+        bedtools intersect -v -a {input.peaks} -b {input.blacklist} > {output.filtered_peaks}
+        """
+
+# Rule to convert BAM to bigWig
+# rule bam_to_bigwig:
+#    input:
+#        bam="results/{condition}_shifted_no_mito_sorted.bam",
+#        bai="results/{condition}_shifted_no_mito_sorted.bam.bai"
+#    output:
+#        bigwig="results/{condition}_shifted_no_mito_sorted.bw"
+#    conda:
+#        'envs/deeptools_env.yml'
+#    shell:
+#        """
+#       bamCoverage --bam {input.bam} --outFileName {output.bigwig}
+#        """
+
+# Rule to compute matrix with deepTools
+rule compute_matrix:
+    input:
+        bigwig="results/{condition}_shifted_no_mito_sorted.bw",
+        hg_bed = "results_interim/hg38_genes.bed"
+    output:
+        matrix="results/{condition}_matrix.gz"
+    conda:
+        'envs/deeptools_env.yml'
+    shell:
+        """
+        computeMatrix reference-point -S {input.bigwig}  -R {input.hg_bed} -out {output.matrix} -b 2000 -a 2000
+        """
+
+# Rule to plot profile using deepTools
+rule coverage_plots:
+    input:
+        matrix="results/{condition}_matrix.gz"
+    output:
+        profile="results/{condition}_profile.pdf"
+    conda:
+        'envs/deeptools_env.yml'
+    shell:
+        """
+        plotProfile -m {input.matrix} -out {output.profile}
+        """
+
+rule chromatin_accessibility:
+    input:
+        peaks='results/ATAC_reproducible_filtered_peaks.bed'
+    output:
+        annotation='results/chromatin_accessibility.txt'
+    conda:
+        'envs/homer_env.yml'
+    shell:
+        """
+        annotatePeaks.pl {input.peaks} hg38 > {output.annotation}
+        """
+
+rule motif_analysis_homer:
+    input:
+        filtered_peaks='results/ATAC_reproducible_filtered_peaks.bed'
+    output:
+        homer_dir=directory('results/homer_motif_analysis/')
+    conda:
+        'envs/homer_env.yml'
+    shell:
+        """
+        findMotifsGenome.pl {input.filtered_peaks} hg38 {output.homer_dir}
+        """
+
+# Rule for HOMER gene annotation
+rule homer_gene_annotation:
+    input:
+        peaks='results/ATAC_reproducible_filtered_peaks.bed'
+    output:
+        gene_annotation='results/homer_gene_annotations.txt'
+    conda:
+        'envs/homer_env.yml'
+    shell:
+        """
+        annotatePeaks.pl {input.peaks} hg38 > {output.gene_annotation}
+        """
+
+rule sort_region_bams:
+    input:
+        "results/{region}_{condition}.bam"
+    output:
+        sorted_bam="results/{region}_{condition}_sorted.bam"
+    conda:
+        "envs/samtools_env.yml"
+    shell:
+        '''
+        samtools sort -o {output.sorted_bam} {input}
+        '''
+
+rule index_region_bam:
+    input:
+        "results/{region}_{condition}_sorted.bam"
+    output:
+        "results/{region}_{condition}_sorted.bam.bai"
+    conda:
+        "envs/samtools_env.yml"
+    shell:
+        '''
+        samtools index {input}
+        '''
+
+rule bam_to_bigwig_region:
+    input:
+        bam="results/{region}_{condition}_sorted.bam",
+        bai="results/{region}_{condition}_sorted.bam.bai"
+    output:
+        bigwig="results/{region}_{condition}.bw"
+    conda:
+        "envs/deeptools_env.yml"
+    shell:
+        '''
+        bamCoverage --bam {input.bam} --outFileName {output.bigwig} --binSize 10 --normalizeUsing RPKM
+        '''
+
+rule prepare_plotProfile:
+    input:
+        bigwig="results/{condition}_shifted_no_mito_sorted.bw",
+        bigwig_NFR="results/NFR_{condition}.bw",
+        bigwig_NBR="results/NBR_{condition}.bw",
+        hg_bed="results/hg38_genes.bed"
+    output:
+        matrix="results/reg_{condition}_matrix.gz"
+    conda:
+        "envs/deeptools_env.yml"
+    shell:
+        """
+        computeMatrix reference-point -S {input.bigwig} {input.bigwig_NFR} {input.bigwig_NBR} -b 2000 -a 2000 -o {output.matrix}
+        """
+
+rule coverage_plots_region:
+    input:
+        matrix="results/reg_{condition}_matrix.gz"
+    output:
+        profile="results/{condition}_profile.pdf"
+    conda:
+        "envs/deeptools_env.yml"
+    shell:
+        '''
+        plotProfile -m {input.matrix} -out {output.profile}
+        '''
